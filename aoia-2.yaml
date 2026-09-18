@@ -1,0 +1,231 @@
+substitutions:
+  # Change this to a unique name for each controller.
+  device_name: air-oasis-aoia-2
+  friendly_name: AirOasis AOIA-2
+
+# The local purifier component reconciles state only from checksum-valid
+# appliance responses; it never publishes a command request as appliance state.
+external_components:
+  - source:
+      type: local
+      path: components
+    components: [aoia_purifier]
+
+esphome:
+  name: ${device_name}
+  friendly_name: ${friendly_name}
+  comment: Local ESPHome replacement for a compatible AOIA-2-series Wi-Fi controller.
+  project:
+    name: air_oasis.aoia_2
+    version: "0.4.0"
+
+esp32:
+  board: esp32dev
+  framework:
+    type: esp-idf
+    version: recommended
+
+logger:
+  level: INFO
+
+api:
+  encryption:
+    key: !secret api_encryption_key
+  reboot_timeout: 1h
+
+ota:
+  - platform: esphome
+    password: !secret ota_password
+
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+  min_auth_mode: WPA2
+  power_save_mode: none
+  ap:
+    ssid: "${friendly_name} Fallback"
+    password: !secret fallback_ap_password
+
+captive_portal:
+
+# Appliance UART: GPIO17 -> J1 UART_TX; GPIO16 <- J1 UART_RX.
+# The programming header uses separate UART0 pins GPIO1/GPIO3.
+uart:
+  id: appliance_uart
+  tx_pin: GPIO17
+  rx_pin: GPIO16
+  baud_rate: 9600
+  data_bits: 8
+  parity: NONE
+  stop_bits: 1
+  rx_buffer_size: 256
+  # A dummy receiver consumes the appliance response stream so this callback can
+  # validate and publish complete state frames without serial logging.
+  debug:
+    direction: RX
+    dummy_receiver: true
+    after:
+      delimiter: [0x44]
+    sequence:
+      - lambda: |-
+          // Response format: AC flags speed_status ... checksum 44.
+          // Only accept its fixed 16-byte, checksum-valid form.
+          if (bytes.size() != 16 || bytes[0] != 0xAC || bytes[15] != 0x44) {
+            return;
+          }
+          uint8_t checksum = 0;
+          for (size_t i = 0; i < 15; i++) {
+            checksum = static_cast<uint8_t>(checksum + bytes[i]);
+          }
+          if (checksum != 0xAC) {
+            return;
+          }
+          id(aoia_current_flags) = bytes[1];
+          id(aoia_current_speed_status) = bytes[2];
+          // Filter counter: unsigned 16-bit big-endian bytes 9–10, scaled
+          // from 0 to 4400 as 0–100% remaining.
+          const uint16_t filter_counter =
+              (static_cast<uint16_t>(bytes[9]) << 8) | bytes[10];
+          // PM2.5: unsigned value at byte 5.
+          id(aoia_pm25_sensor).publish_state(bytes[5]);
+          float filter_life_percent =
+              static_cast<float>(filter_counter) * 100.0f / 4400.0f;
+          if (filter_life_percent > 100.0f) {
+            filter_life_percent = 100.0f;
+          }
+          id(aoia_filter_life_sensor).publish_state(
+              static_cast<uint8_t>(filter_life_percent + 0.5f));
+          id(aoia_state_known) = true;
+          id(aoia_purifier_entity).update_from_appliance(bytes[1], bytes[2]);
+
+globals:
+  # State is unknown after a cold boot until the purifier emits a valid reply.
+  - id: aoia_current_flags
+    type: uint8_t
+    restore_value: no
+    initial_value: '0'
+  - id: aoia_current_speed_status
+    type: uint8_t
+    restore_value: no
+    initial_value: '0'
+  - id: aoia_state_known
+    type: bool
+    restore_value: no
+    initial_value: 'false'
+
+# AOIA command frame:
+#   BB 02 flags speed_code 03 00 00 00 00 00 checksum 44
+# The sum from BB through checksum is BB modulo 256. The purifier component
+# preserves the response's complete flag bitmap in every outgoing command.
+fan:
+  - platform: aoia_purifier
+    id: aoia_purifier_entity
+    name: "${friendly_name}"
+    uart_id: appliance_uart
+
+# HA's generic fan tile can collapse discrete speeds into a percentage slider.
+# This dedicated dropdown exposes the purifier's native mode names, while its
+# state remains derived exclusively from checksum-valid appliance replies.
+select:
+  - platform: template
+    id: aoia_purifier_mode_select
+    name: "${friendly_name} Fan Mode"
+    icon: mdi:fan-auto
+    options:
+      - Auto
+      - Low
+      - Medium
+      - High
+      - Max
+    lambda: |-
+      if (!id(aoia_state_known)) {
+        return {};
+      }
+      switch (id(aoia_current_speed_status)) {
+        case 0x11:
+          return std::string("Auto");
+        case 0x13:
+          return std::string("Low");
+        case 0x23:
+          return std::string("Medium");
+        case 0x33:
+          return std::string("High");
+        case 0x43:
+          return std::string("Max");
+        default:
+          return {};
+      }
+    set_action:
+      - lambda: id(aoia_purifier_entity).set_mode(x.c_str());
+    update_interval: 1s
+
+switch:
+  # These template switches do not use optimistic mode. Their lambdas expose no
+  # state until a checksum-valid response arrives; commands are gated in the
+  # purifier component until the response also establishes a mapped operating mode.
+  - platform: template
+    id: aoia_uv_switch
+    name: "${friendly_name} UV"
+    icon: mdi:weather-sunny
+    restore_mode: DISABLED
+    lambda: |-
+      if (!id(aoia_state_known)) {
+        return {};
+      }
+      return (id(aoia_current_flags) & 0x08) != 0;
+    turn_on_action:
+      - lambda: id(aoia_purifier_entity).set_option(0x08, true);
+    turn_off_action:
+      - lambda: id(aoia_purifier_entity).set_option(0x08, false);
+
+  - platform: template
+    id: aoia_ionizer_switch
+    name: "${friendly_name} Ionizer"
+    icon: mdi:weather-windy
+    restore_mode: DISABLED
+    lambda: |-
+      if (!id(aoia_state_known)) {
+        return {};
+      }
+      return (id(aoia_current_flags) & 0x20) != 0;
+    turn_on_action:
+      - lambda: id(aoia_purifier_entity).set_option(0x20, true);
+    turn_off_action:
+      - lambda: id(aoia_purifier_entity).set_option(0x20, false);
+
+  - platform: template
+    id: aoia_child_lock_switch
+    name: "${friendly_name} Night and Child Lock"
+    icon: mdi:lock
+    restore_mode: DISABLED
+    lambda: |-
+      if (!id(aoia_state_known)) {
+        return {};
+      }
+      return (id(aoia_current_flags) & 0x04) != 0;
+    turn_on_action:
+      - lambda: id(aoia_purifier_entity).set_option(0x04, true);
+    turn_off_action:
+      - lambda: id(aoia_purifier_entity).set_option(0x04, false);
+
+sensor:
+  # Local filter life from checksum-valid response bytes 9–10 (0–100%).
+  - platform: template
+    id: aoia_filter_life_sensor
+    name: "${friendly_name} Filter life"
+    icon: mdi:air-filter
+    unit_of_measurement: "%"
+    state_class: measurement
+    accuracy_decimals: 0
+    update_interval: never
+
+  # Local particulate reading from reply byte 5, published only after the
+  # enclosing fixed-length frame passes its additive checksum validation.
+  - platform: template
+    id: aoia_pm25_sensor
+    name: "${friendly_name} PM2.5"
+    device_class: pm25
+    unit_of_measurement: "µg/m³"
+    state_class: measurement
+    accuracy_decimals: 0
+    update_interval: never

@@ -1,0 +1,18 @@
+# ESPHome build and local IDE state
+.esphome/
+.vscode/
+.idea/
+*~
+
+# Local credentials and generated firmware
+secrets.yaml
+*.local.yaml
+*.bin
+*.elf
+*.map
+*.log
+
+# Python and OS files
+__pycache__/
+*.py[cod]
+.DS_Store
