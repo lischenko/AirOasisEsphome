@@ -1,7 +1,7 @@
 substitutions:
   # Change this to a unique name for each controller.
-  device_name: air-oasis-aoia-2
-  friendly_name: AirOasis AOIA-2
+  device_name: air-oasis-aoia-2l
+  friendly_name: AirOasis AOIA-2L
 
 # The local purifier component reconciles state only from checksum-valid
 # appliance responses; it never publishes a command request as appliance state.
@@ -208,7 +208,22 @@ switch:
     turn_off_action:
       - lambda: id(aoia_purifier_entity).set_option(0x04, false);
 
+button:
+  - platform: restart
+    name: "${friendly_name} Restart"
+    entity_category: diagnostic
+
 sensor:
+  - platform: wifi_signal
+    name: "${friendly_name} WiFi Signal"
+    update_interval: 60s
+    entity_category: diagnostic
+
+  - platform: uptime
+    name: "${friendly_name} Uptime"
+    update_interval: 60s
+    entity_category: diagnostic
+
   # Local filter life from checksum-valid response bytes 9–10 (0–100%).
   - platform: template
     id: aoia_filter_life_sensor
